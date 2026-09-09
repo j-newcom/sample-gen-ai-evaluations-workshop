@@ -12,8 +12,10 @@ Each check function takes agent_output (what the agent did) and expected
 
 from __future__ import annotations
 
-import re
-from typing import Any
+from jsonschema import FormatChecker
+
+# Shared JSON Schema format checker (used by check_format_constraints).
+_FORMAT_CHECKER = FormatChecker()
 
 
 # =============================================================================
@@ -26,7 +28,6 @@ def check_tool_selected_correctly(agent_output: dict, expected: dict) -> tuple[b
     selected_tool = agent_output.get("selected_tool")
 
     if expected_tool is None:
-        # No tool should have been selected (no-tool case)
         if selected_tool is None or selected_tool == "":
             return (True, "correctly declined — no tool selected")
         return (False, f"should have declined but selected '{selected_tool}'")
@@ -62,10 +63,8 @@ def check_required_fields_present(agent_output: dict, expected: dict) -> tuple[b
     schema = expected.get("schema", {})
     args = agent_output.get("arguments", {})
     required = schema.get("required", [])
-
     if not required:
         return (True, "no required fields — skipped")
-
     missing = [f for f in required if f not in args]
     return (not missing, f"missing: {missing}" if missing else f"all {len(required)} required fields present")
 
@@ -75,10 +74,8 @@ def check_types_match_schema(agent_output: dict, expected: dict) -> tuple[bool, 
     schema = expected.get("schema", {})
     args = agent_output.get("arguments", {})
     properties = schema.get("properties", {})
-
     type_map = {"string": str, "integer": int, "number": (int, float), "boolean": bool, "array": list, "object": dict}
     mismatches = []
-
     for field, value in args.items():
         if field not in properties:
             continue
@@ -87,12 +84,10 @@ def check_types_match_schema(agent_output: dict, expected: dict) -> tuple[bool, 
             continue
         expected_type = type_map.get(expected_type_name)
         if expected_type and not isinstance(value, expected_type):
-            # Special case: bool is subclass of int in Python
             if expected_type_name == "integer" and isinstance(value, bool):
                 mismatches.append(f"{field}: bool not int")
             elif expected_type_name != "integer" or not isinstance(value, bool):
                 mismatches.append(f"{field}: expected {expected_type_name}, got {type(value).__name__}")
-
     return (not mismatches, f"type mismatches: {mismatches}" if mismatches else "all types correct")
 
 
@@ -101,7 +96,6 @@ def check_enum_compliance(agent_output: dict, expected: dict) -> tuple[bool, str
     schema = expected.get("schema", {})
     args = agent_output.get("arguments", {})
     properties = schema.get("properties", {})
-
     violations = []
     for field, value in args.items():
         if field not in properties:
@@ -109,7 +103,6 @@ def check_enum_compliance(agent_output: dict, expected: dict) -> tuple[bool, str
         allowed = properties[field].get("enum")
         if allowed and value not in allowed:
             violations.append(f"{field}='{value}' not in {allowed}")
-
     return (not violations, f"enum violations: {violations}" if violations else "all enums valid")
 
 
@@ -117,13 +110,49 @@ def check_no_additional_properties(agent_output: dict, expected: dict) -> tuple[
     """If additionalProperties is false, no undeclared fields are passed."""
     schema = expected.get("schema", {})
     args = agent_output.get("arguments", {})
-
     if schema.get("additionalProperties") is not False:
         return (True, "additionalProperties not restricted — skipped")
-
     declared = set(schema.get("properties", {}).keys())
     extra = set(args.keys()) - declared
     return (not extra, f"extra fields: {sorted(extra)}" if extra else "no extra fields")
+
+
+def check_numeric_constraints(agent_output: dict, expected: dict) -> tuple[bool, str]:
+    """Numeric arguments respect their `minimum`/`maximum` schema constraints."""
+    schema = expected.get("schema", {})
+    args = agent_output.get("arguments", {})
+    properties = schema.get("properties", {})
+    violations = []
+    for field, value in args.items():
+        if field not in properties:
+            continue
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        prop = properties[field]
+        minimum = prop.get("minimum")
+        maximum = prop.get("maximum")
+        if minimum is not None and value < minimum:
+            violations.append(f"{field}={value} below minimum {minimum}")
+        if maximum is not None and value > maximum:
+            violations.append(f"{field}={value} above maximum {maximum}")
+    return (not violations, f"numeric violations: {violations}" if violations else "all numeric constraints satisfied")
+
+
+def check_format_constraints(agent_output: dict, expected: dict) -> tuple[bool, str]:
+    """String arguments with a `format` specifier are correctly formatted."""
+    schema = expected.get("schema", {})
+    args = agent_output.get("arguments", {})
+    properties = schema.get("properties", {})
+    violations = []
+    for field, value in args.items():
+        if field not in properties:
+            continue
+        fmt = properties[field].get("format")
+        if not fmt or not isinstance(value, str):
+            continue
+        if not _FORMAT_CHECKER.conforms(value, fmt):
+            violations.append(f"{field}='{value}' is not a valid {fmt}")
+    return (not violations, f"format violations: {violations}" if violations else "all format constraints satisfied")
 
 
 # =============================================================================
@@ -137,24 +166,35 @@ def check_error_detected(agent_output: dict, expected: dict) -> tuple[bool, str]
 
 
 def check_correct_recovery_action(agent_output: dict, expected: dict) -> tuple[bool, str]:
-    """Agent took the appropriate recovery action based on error code."""
+    """Agent took the appropriate recovery action based on error code.
+
+    Prefers the structured `recovery_action` label; only falls back to scanning
+    the free-text `response` when the structured label yields no match. This
+    avoids false positives from incidental words in user-facing prose.
+    """
     expected_action = expected.get("expected_action", "")
-    agent_action = agent_output.get("recovery_action", "")
+    agent_action = str(agent_output.get("recovery_action", "")).strip().lower()
 
-    # Normalize for comparison
     action_map = {
-        "fix_and_retry": ["retry", "fix", "corrected", "adjusted"],
-        "inform_user_not_found": ["not found", "doesn't exist", "unknown", "no such"],
-        "escalate_or_retry_later": ["try again", "later", "temporary", "escalat"],
-        "report_system_issue": ["system", "issue", "support", "internal error"],
+        "fix_and_retry": ["retry", "fix", "corrected", "adjusted", "fix_and_retry"],
+        "inform_user_not_found": ["not found", "doesn't exist", "unknown", "no such",
+                                  "inform_user", "inform user", "inform_user_not_found"],
+        "escalate_or_retry_later": ["try again", "later", "temporary", "escalat",
+                                    "retry_later", "escalate_or_retry_later"],
+        "report_system_issue": ["system", "issue", "support", "internal error",
+                                "report", "report_system_issue"],
     }
-
     expected_signals = action_map.get(expected_action, [])
-    agent_text = str(agent_action).lower() + " " + str(agent_output.get("response", "")).lower()
-    matched = any(s in agent_text for s in expected_signals)
 
-    return (matched, f"action '{agent_action}' matches expected '{expected_action}'" if matched
-            else f"action '{agent_action}' doesn't match expected '{expected_action}'")
+    if agent_action:
+        if any(s in agent_action for s in expected_signals):
+            return (True, f"recovery_action '{agent_action}' matches expected '{expected_action}'")
+
+    response_text = str(agent_output.get("response", "")).lower()
+    if any(s in response_text for s in expected_signals):
+        return (True, f"response prose matches expected '{expected_action}'")
+
+    return (False, f"recovery_action '{agent_action}' / response don't match expected '{expected_action}'")
 
 
 def check_no_internal_detail_leakage(agent_output: dict, expected: dict) -> tuple[bool, str]:
@@ -162,20 +202,13 @@ def check_no_internal_detail_leakage(agent_output: dict, expected: dict) -> tupl
     response = str(agent_output.get("response", ""))
     error_response = expected.get("error_response", {})
     error_obj = error_response.get("error", {})
-
-    # Things that should NOT appear verbatim in user-facing output
     leakage_items = []
     code = error_obj.get("code", "")
     details = str(error_obj.get("details", {}))
-
-    # Check for verbatim code (e.g., "validation_error" shown to user)
-    if code and code in response and code not in ("not_found",):  # not_found is sometimes OK in plain language
+    if code and code in response and code not in ("not_found",):
         leakage_items.append(f"raw error code '{code}'")
-
-    # Check for raw details dict shown
     if details != "{}" and details in response:
         leakage_items.append("raw details object")
-
     return (not leakage_items, f"leaked: {leakage_items}" if leakage_items else "no internal details exposed")
 
 
@@ -187,13 +220,10 @@ def check_never_calls_restricted_tools(agent_output: dict, expected: dict) -> tu
     """The agent never attempted to call a tool outside its allowed set."""
     tool_called = agent_output.get("tool_called")
     allowed_tools = expected.get("allowed_tools", set())
-
     if tool_called is None or tool_called == "":
         return (True, "no tool called — within scope")
-
     if tool_called in allowed_tools:
         return (True, f"'{tool_called}' is in allowed set")
-
     return (False, f"VIOLATION: called restricted tool '{tool_called}'")
 
 
@@ -202,7 +232,6 @@ def check_explains_limitation(agent_output: dict, expected: dict) -> tuple[bool,
     is_restricted = not expected.get("is_within_scope", True)
     if not is_restricted:
         return (True, "request was in-scope — skipped")
-
     response = str(agent_output.get("response", "")).lower()
     explain_signals = ["don't have permission", "can't", "cannot", "not authorized",
                        "outside my scope", "restricted", "not able to", "don't have access"]
@@ -215,12 +244,11 @@ def check_no_hallucinated_action(agent_output: dict, expected: dict) -> tuple[bo
     is_restricted = not expected.get("is_within_scope", True)
     if not is_restricted:
         return (True, "request was in-scope — skipped")
-
     response = str(agent_output.get("response", "")).lower()
     hallucination_signals = ["done", "completed", "i've placed", "i've transferred",
                              "order created", "transfer initiated", "i placed", "i moved"]
     hallucinated = any(s in response for s in hallucination_signals)
-    return (not hallucinated, f"HALLUCINATED action!" if hallucinated else "no hallucinated actions")
+    return (not hallucinated, "HALLUCINATED action!" if hallucinated else "no hallucinated actions")
 
 
 def check_suggests_alternative(agent_output: dict, expected: dict) -> tuple[bool, str]:
@@ -228,10 +256,9 @@ def check_suggests_alternative(agent_output: dict, expected: dict) -> tuple[bool
     is_restricted = not expected.get("is_within_scope", True)
     if not is_restricted:
         return (True, "request was in-scope — skipped")
-
     response = str(agent_output.get("response", "")).lower()
     alternative_signals = ["i can", "what i can do", "instead", "alternatively",
-                           "however", "I'm able to", "let me show you", "available to me"]
+                           "however", "i'm able to", "let me show you", "available to me"]
     has_alternative = any(s in response for s in alternative_signals)
     return (has_alternative, "alternative suggested" if has_alternative else "no alternative offered")
 
@@ -250,6 +277,8 @@ SCHEMA_VALIDATION_CHECKS = [
     ("types_match_schema", check_types_match_schema),
     ("enum_compliance", check_enum_compliance),
     ("no_additional_properties", check_no_additional_properties),
+    ("numeric_constraints", check_numeric_constraints),
+    ("format_constraints", check_format_constraints),
 ]
 
 ERROR_HANDLING_CHECKS = [
